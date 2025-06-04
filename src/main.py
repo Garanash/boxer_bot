@@ -9,38 +9,53 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 from telebot.asyncio_handler_backends import State, StatesGroup
 import logging
 import ssl
-import asyncio
 from aiohttp import ClientSession, TCPConnector, ClientTimeout
 from telebot import asyncio_helper
-from telebot.async_telebot import AsyncTeleBot
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-async def create_ssl_disabled_session():
-    """Создает сессию с отключенной проверкой SSL"""
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
+def fix_training_sessions():
+    try:
+        # Обновляем все записи без даты
+        cursor.execute('''
+        UPDATE training_sessions 
+        SET date = CURRENT_DATE 
+        WHERE date IS NULL
+        ''')
 
-    # Устанавливаем таймауты для клиента
-    timeout = ClientTimeout(total=60, connect=30)
+        # Получаем количество обновленных записей
+        updated_count = cursor.rowcount
 
-    return ClientSession(
-        connector=TCPConnector(ssl=ssl_context),
-        trust_env=True,
-        timeout=timeout
-    )
+        # Устанавливаем дефолтное значение для новых записей
+        cursor.execute('''
+        ALTER TABLE training_sessions 
+        ALTER COLUMN date SET DEFAULT CURRENT_DATE
+        ''')
+
+        conn.commit()
+        return updated_count
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка при исправлении записей: {e}")
+        conn.rollback()
+        return 0
 
 # Инициализация бота
 API_TOKEN = '8141145566:AAGfUGgkp-pyWYlL_sJTx3gWXt-HydT52wY'
 storage = StateMemoryStorage()
-bot = AsyncTeleBot(API_TOKEN)
+bot = AsyncTeleBot(API_TOKEN, state_storage=storage)
 
 # Подключение к базе данных SQLite
 conn = sqlite3.connect('training_bot.db', check_same_thread=False)
 cursor = conn.cursor()
+
+# Вызываем функцию
+updated_records = fix_training_sessions()
+if updated_records > 0:
+    logger.info(f"Исправлено {updated_records} записей без даты")
+# После создания всех таблиц
 
 # Создание таблиц
 cursor.execute('''
@@ -85,11 +100,53 @@ CREATE TABLE IF NOT EXISTS bookings (
 )
 ''')
 
+cursor.execute('''
+UPDATE users SET is_admin = 1 WHERE user_id = ?
+''', ('7513623853',))
 conn.commit()
 
+# Добавляем тренера и тренировку
+cursor.execute('''
+INSERT OR IGNORE INTO trainers (trainer_id, name, phone, specialization)
+VALUES (1, 'Иванов Иван Иванович', '+79999999999', 'Йога')
+''')
+
+conn.commit()
+
+
+
+def initialize_test_data():
+    today = date.today()
+    trainer_ids = [1, 2]
+
+    for i in range(14):
+        training_date = today + timedelta(days=i)
+
+        # Утренняя тренировка
+        cursor.execute('''
+        INSERT OR IGNORE INTO training_sessions 
+        (date, time, address, price, max_participants, trainer_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ''', (training_date.strftime('%Y-%m-%d'), "09:00", "ул. Спортивная, 10",
+              1000, 10, trainer_ids[i % 2]))
+
+        # Вечерняя тренировка
+        cursor.execute('''
+        INSERT OR IGNORE INTO training_sessions 
+        (date, time, address, price, max_participants, trainer_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ''', (training_date.strftime('%Y-%m-%d'), "18:00", "ул. Тренировочная, 5",
+              1500, 15, trainer_ids[(i + 1) % 2]))
+
+    conn.commit()
+
+
+# Вызываем инициализацию тестовых данных
+initialize_test_data()
+
 # Callback data factory
-training_factory = CallbackData('training', 'action', 'session_id', prefix='training')
 date_factory = CallbackData('date', 'action', 'day', prefix='date')
+training_factory = CallbackData('training', 'action', 'session_id', prefix='training')
 
 
 # States
@@ -174,7 +231,7 @@ async def cancel_booking(booking_id):
 
 
 # Handlers
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=['start', 'help'])
 async def send_welcome(message):
     user_id = message.from_user.id
     username = message.from_user.username
@@ -182,16 +239,32 @@ async def send_welcome(message):
 
     await create_user(user_id, username, full_name)
 
-    markup = ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add(KeyboardButton('📝 Запись на тренировку'))
-    markup.add(KeyboardButton('📋 Мои записи'))
-    markup.add(KeyboardButton('👨‍🏫 Мой тренер'))
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        KeyboardButton('📝 Запись на тренировку'),
+        KeyboardButton('📋 Мои записи'),
+        KeyboardButton('👨‍🏫 Мой тренер'),
+        KeyboardButton('ℹ️ Помощь')
+    )
 
+    with open('trainer_sergey.jpeg','rb') as trainer_photo:
+        await bot.send_photo(
+            message.chat.id, photo=trainer_photo, caption=
+            "🏋️‍♂️ Добро пожаловать в систему записи на тренировки!\n\n"
+            "Выберите действие на клавиатуре ниже:",
+            reply_markup=markup
+        )
+
+
+@bot.message_handler(func=lambda message: message.text == 'ℹ️ Помощь')
+async def show_help(message):
     await bot.send_message(
         message.chat.id,
-        "Добро пожаловать в систему записи на тренировки!\n\n"
-        "Выберите действие:",
-        reply_markup=markup
+        "ℹ️ Справка по боту:\n\n"
+        "📝 Запись на тренировку - выбрать дату и записаться на тренировку\n"
+        "📋 Мои записи - просмотреть свои активные записи\n"
+        "👨‍🏫 Мой тренер - информация о вашем тренере\n\n"
+        "Для начала работы просто выберите действие на клавиатуре."
     )
 
 
@@ -202,127 +275,201 @@ async def start_booking(message):
     markup = InlineKeyboardMarkup()
     for day in dates:
         formatted_day = datetime.strptime(day, '%Y-%m-%d').strftime('%d.%m.%Y')
+        callback_data = date_factory.new(action='select', day=day)
+        logger.info(f"Создаём кнопку для даты {day} с callback_data: {callback_data}")
         markup.add(InlineKeyboardButton(
             text=formatted_day,
-            callback_data=date_factory.new(action='select', day=day)
+            callback_data=callback_data
         ))
 
     await bot.send_message(
         message.chat.id,
-        "Выберите дату тренировки:",
+        "📅 Выберите дату тренировки:",
         reply_markup=markup
     )
 
 
 @bot.callback_query_handler(func=None, date_config=date_factory.filter(action='select'))
 async def select_date_callback(call):
-    selected_date = date_factory.parse(callback_data=call.data)['day']
-    sessions = await get_sessions_by_date(selected_date)
+    try:
+        logger.info(f"Получен callback запрос: {call.data}")
+        data = date_factory.parse(callback_data=call.data)
+        logger.info(f"Разобранный callback: {data}")
+        selected_date = data['day']
 
-    if not sessions:
-        await bot.answer_callback_query(call.id, "На выбранную дату нет доступных тренировок")
-        return
+        # Проверяем, что дата корректная
+        try:
+            datetime.strptime(selected_date, '%Y-%m-%d')
+            logger.info(f"Дата {selected_date} корректна")
+        except ValueError:
+            logger.error(f"Некорректный формат даты: {selected_date}")
+            await bot.answer_callback_query(call.id, "Ошибка: некорректный формат даты")
+            return
 
-    markup = InlineKeyboardMarkup()
-    for session in sessions:
-        session_id, time, address, price, max_participants, trainer_name, booked_count = session
-        available = max_participants - booked_count
-        markup.add(InlineKeyboardButton(
-            text=f"{time} - {address} ({price}₽) - {available}/{max_participants} мест",
-            callback_data=training_factory.new(action='select', session_id=session_id)
-        ))
+        # Получаем тренировки на выбранную дату
+        cursor.execute('''
+        SELECT ts.session_id, ts.time, ts.address, ts.price, ts.max_participants, 
+               t.name as trainer_name
+        FROM training_sessions ts
+        LEFT JOIN trainers t ON ts.trainer_id = t.trainer_id
+        WHERE ts.date = ? AND ts.date IS NOT NULL
+        ''', (selected_date,))
+        sessions = cursor.fetchall()
 
-    formatted_date = datetime.strptime(selected_date, '%Y-%m-%d').strftime('%d.%m.%Y')
-    await bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text=f"Доступные тренировки на {formatted_date}:",
-        reply_markup=markup
-    )
+        if not sessions:
+            await bot.answer_callback_query(call.id, "На выбранную дату нет доступных тренировок")
+            return
+
+        # Получаем количество записей на каждую тренировку
+        session_ids = [str(session[0]) for session in sessions]
+        placeholders = ','.join('?' for _ in session_ids)
+
+        cursor.execute(f'''
+        SELECT session_id, COUNT(*) as booked_count 
+        FROM bookings 
+        WHERE session_id IN ({placeholders})
+        GROUP BY session_id
+        ''', session_ids)
+        bookings = {row[0]: row[1] for row in cursor.fetchall()}
+
+        markup = InlineKeyboardMarkup()
+        for session in sessions:
+            session_id, time, address, price, max_participants, trainer_name = session
+            booked_count = bookings.get(session_id, 0)
+            available = max_participants - booked_count
+
+            if available > 0:
+                markup.add(InlineKeyboardButton(
+                    text=f"{time} - {address} ({price}₽) - {available}/{max_participants} мест",
+                    callback_data=training_factory.new(action='select', session_id=session_id)
+                ))
+
+        formatted_date = datetime.strptime(selected_date, '%Y-%m-%d').strftime('%d.%m.%Y')
+        await bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=f"🏋️‍♂️ Доступные тренировки на {formatted_date}:",
+            reply_markup=markup
+        )
+    except Exception as e:
+        logger.error(f"Error in select_date_callback: {str(e)}", exc_info=True)
+        await bot.answer_callback_query(call.id, "Ошибка при загрузке тренировок")
 
 
 @bot.callback_query_handler(func=None, training_config=training_factory.filter(action='select'))
 async def select_training_callback(call):
-    session_id = training_factory.parse(callback_data=call.data)['session_id']
+    try:
+        data = training_factory.parse(callback_data=call.data)
+        session_id = data['session_id']
 
-    cursor.execute('''
-    SELECT ts.date, ts.time, ts.address, ts.price, t.name
-    FROM training_sessions ts
-    LEFT JOIN trainers t ON ts.trainer_id = t.trainer_id
-    WHERE ts.session_id = ?
-    ''', (session_id,))
-    session = cursor.fetchone()
+        # Получаем полную информацию о тренировке
+        cursor.execute('''
+        SELECT ts.date, ts.time, ts.address, ts.price, ts.max_participants, 
+               t.name as trainer_name
+        FROM training_sessions ts
+        LEFT JOIN trainers t ON ts.trainer_id = t.trainer_id
+        WHERE ts.session_id = ?
+        ''', (session_id,))
+        session = cursor.fetchone()
 
-    if not session:
-        await bot.answer_callback_query(call.id, "Тренировка не найдена")
-        return
+        if not session:
+            await bot.answer_callback_query(call.id, "Тренировка не найдена", show_alert=True)
+            return
 
-    date_str, time_str, address, price, trainer_name = session
-    formatted_date = datetime.strptime(date_str, '%Y-%m-%d').strftime('%d.%m.%Y')
+        date_str, time_str, address, price, max_participants, trainer_name = session
 
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton(
-        text="✅ Подтвердить запись",
-        callback_data=training_factory.new(action='confirm', session_id=session_id)
-    ))
-    markup.add(InlineKeyboardButton(
-        text="❌ Отмена",
-        callback_data=training_factory.new(action='cancel', session_id=session_id)
-    ))
+        # Проверяем что дата существует
+        if not date_str:
+            await bot.answer_callback_query(call.id, "Ошибка: дата тренировки не указана", show_alert=True)
+            return
 
-    await bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text=f"Вы выбрали тренировку:\n\n"
-             f"📅 Дата: {formatted_date}\n"
-             f"⏰ Время: {time_str}\n"
-             f"📍 Адрес: {address}\n"
-             f"💵 Цена: {price}₽\n"
-             f"👨‍🏫 Тренер: {trainer_name}\n\n"
-             f"Подтвердите запись:",
-        reply_markup=markup
-    )
+        # Проверяем количество доступных мест
+        cursor.execute('''
+        SELECT COUNT(*) FROM bookings WHERE session_id = ?
+        ''', (session_id,))
+        booked_count = cursor.fetchone()[0]
+        available = max_participants - booked_count
 
+        if available <= 0:
+            await bot.answer_callback_query(call.id, "К сожалению, все места уже заняты", show_alert=True)
+            return
+
+        formatted_date = datetime.strptime(date_str, '%Y-%m-%d').strftime('%d.%m.%Y')
+
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton(
+            text="✅ Подтвердить запись",
+            callback_data=training_factory.new(action='confirm', session_id=session_id)
+        ))
+        markup.add(InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data=training_factory.new(action='cancel', session_id=session_id)
+        ))
+
+        await bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=f"🏋️‍♂️ Вы выбрали тренировку:\n\n"
+                 f"📅 Дата: {formatted_date}\n"
+                 f"⏰ Время: {time_str}\n"
+                 f"📍 Адрес: {address}\n"
+                 f"💵 Цена: {price}₽\n"
+                 f"👨‍🏫 Тренер: {trainer_name}\n"
+                 f"✅ Доступно мест: {available}\n\n"
+                 f"Подтвердите запись:",
+            reply_markup=markup
+        )
+    except Exception as e:
+        logger.error(f"Error in select_training_callback: {str(e)}", exc_info=True)
+        await bot.answer_callback_query(call.id, "Произошла ошибка при обработке запроса", show_alert=True)
 
 @bot.callback_query_handler(func=None, training_config=training_factory.filter(action='confirm'))
 async def confirm_booking_callback(call):
-    session_id = training_factory.parse(callback_data=call.data)['session_id']
-    user_id = call.from_user.id
+    try:
+        data = training_factory.parse(callback_data=call.data)
+        session_id = data['session_id']
+        user_id = call.from_user.id
 
-    # Проверка доступности мест
-    cursor.execute('''
-    SELECT ts.max_participants, COUNT(b.booking_id) as booked_count
-    FROM training_sessions ts
-    LEFT JOIN bookings b ON ts.session_id = b.session_id
-    WHERE ts.session_id = ?
-    GROUP BY ts.session_id
-    ''', (session_id,))
-    result = cursor.fetchone()
+        # Проверяем существование тренировки и доступность мест
+        cursor.execute('''
+        SELECT ts.date, ts.time, ts.max_participants, 
+               (SELECT COUNT(*) FROM bookings WHERE session_id = ?) as booked_count
+        FROM training_sessions ts
+        WHERE ts.session_id = ? AND ts.date IS NOT NULL
+        ''', (session_id, session_id))
+        result = cursor.fetchone()
 
-    if not result:
-        await bot.answer_callback_query(call.id, "Тренировка не найдена")
-        return
+        if not result:
+            await bot.answer_callback_query(call.id, "Тренировка не найдена")
+            return
 
-    max_participants, booked_count = result
-    if booked_count >= max_participants:
-        await bot.answer_callback_query(call.id, "К сожалению, все места уже заняты")
-        return
+        date_str, time_str, max_participants, booked_count = result
 
-    # Проверка, не записан ли уже пользователь
-    cursor.execute('''
-    SELECT booking_id FROM bookings 
-    WHERE user_id = ? AND session_id = ?
-    ''', (user_id, session_id))
-    if cursor.fetchone():
-        await bot.answer_callback_query(call.id, "Вы уже записаны на эту тренировку")
-        return
+        if booked_count >= max_participants:
+            await bot.answer_callback_query(call.id, "К сожалению, все места уже заняты")
+            return
 
-    # Запись на тренировку
-    await book_training(user_id, session_id)
+        # Проверяем, не записан ли уже пользователь
+        cursor.execute('''
+        SELECT 1 FROM bookings WHERE user_id = ? AND session_id = ?
+        ''', (user_id, session_id))
+        if cursor.fetchone():
+            await bot.answer_callback_query(call.id, "Вы уже записаны на эту тренировку")
+            return
 
-    await bot.answer_callback_query(call.id, "Вы успешно записаны на тренировку!")
-    await bot.delete_message(call.message.chat.id, call.message.message_id)
+        # Создаем запись
+        booking_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute('''
+        INSERT INTO bookings (user_id, session_id, booking_date)
+        VALUES (?, ?, ?)
+        ''', (user_id, session_id, booking_date))
+        conn.commit()
 
+        await bot.answer_callback_query(call.id, "✅ Вы успешно записаны на тренировку!")
+        await bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception as e:
+        logger.error(f"Error in confirm_booking_callback: {e}")
+        await bot.answer_callback_query(call.id, "Ошибка при записи на тренировку")
 
 @bot.message_handler(func=lambda message: message.text == '📋 Мои записи')
 async def show_my_bookings(message):
@@ -330,7 +477,7 @@ async def show_my_bookings(message):
     bookings = await get_user_bookings(user_id)
 
     if not bookings:
-        await bot.send_message(message.chat.id, "У вас нет активных записей на тренировки")
+        await bot.send_message(message.chat.id, "📭 У вас нет активных записей на тренировки")
         return
 
     for booking in bookings:
@@ -345,6 +492,7 @@ async def show_my_bookings(message):
 
         await bot.send_message(
             message.chat.id,
+            f"🏋️‍♂️ Ваша тренировка:\n\n"
             f"📅 Дата: {formatted_date}\n"
             f"⏰ Время: {time_str}\n"
             f"📍 Адрес: {address}\n"
@@ -359,7 +507,7 @@ async def cancel_booking_callback(call):
     booking_id = training_factory.parse(callback_data=call.data)['session_id']
 
     await cancel_booking(booking_id)
-    await bot.answer_callback_query(call.id, "Вы отменили запись на тренировку")
+    await bot.answer_callback_query(call.id, "❌ Вы отменили запись на тренировку")
     await bot.delete_message(call.message.chat.id, call.message.message_id)
 
 
@@ -396,7 +544,7 @@ async def show_my_trainer(message):
     else:
         await bot.send_message(
             message.chat.id,
-            "У вас пока нет тренера. Запишитесь на тренировку, чтобы получить тренера."
+            "🤷‍♂️ У вас пока нет тренера. Запишитесь на тренировку, чтобы получить тренера."
         )
 
 
@@ -425,29 +573,16 @@ async def admin_panel(message):
 
 # Запуск бота
 async def main():
-    session = None
+    logger.info("Starting bot...")
     try:
-        # 1. Создаем кастомную сессию
-        session = await create_ssl_disabled_session()
-        asyncio_helper.session = session
+        # Удаляем вебхук перед запуском polling
+        await bot.remove_webhook()
 
-        # 2. Инициализируем бота
-        bot = AsyncTeleBot("8141145566:AAGfUGgkp-pyWYlL_sJTx3gWXt-HydT52wY")
-
-        logger.info("Starting bot...")
-        await bot.polling(
-            none_stop=True,
-            interval=0,
-            timeout=30,
-            request_timeout=60,
-            skip_pending=True
-        )
+        # Запускаем бота
+        await bot.infinity_polling()
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
     finally:
-        # 3. Корректное закрытие сессии
-        if session and not session.closed:
-            await session.close()
         logger.info("Bot stopped")
 
 
